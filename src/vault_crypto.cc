@@ -14,6 +14,89 @@
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
 #include <cstdio>
+#include <array>
+#include <thread>
+
+#ifdef __x86_64__
+#include <immintrin.h>
+#endif
+
+// Performance optimization constants
+namespace OptimizationConstants {
+    static constexpr size_t CACHE_LINE_SIZE = 64;
+    static constexpr size_t SMALL_BUFFER_THRESHOLD = 1024; // 1KB
+    static constexpr size_t STACK_BUFFER_SIZE = 512;
+    static constexpr size_t ALIGNMENT = 32; // For SIMD operations
+}
+
+// High-performance memory operations
+namespace FastMemory {
+    
+    // SIMD-optimized secure memory clear
+    inline void secure_clear_fast(void* ptr, size_t size) {
+        #if defined(__x86_64__) && defined(__AVX2__)
+        // Use SIMD for large clears when available
+        if (size >= 32) {
+            __m256i zero = _mm256_setzero_si256();
+            char* p = static_cast<char*>(ptr);
+            size_t simd_size = size & ~31; // Round down to multiple of 32
+            
+            for (size_t i = 0; i < simd_size; i += 32) {
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(p + i), zero);
+            }
+            
+            // Clear remaining bytes
+            if (size > simd_size) {
+                OPENSSL_cleanse(p + simd_size, size - simd_size);
+            }
+        } else {
+            OPENSSL_cleanse(ptr, size);
+        }
+        #else
+        // Fallback to OpenSSL's secure clear
+        OPENSSL_cleanse(ptr, size);
+        #endif
+    }
+    
+    // Fast memory copy with prefetch hints
+    inline void fast_copy(void* dest, const void* src, size_t size) {
+        #ifdef __x86_64__
+        if (size >= 64) {
+            // Prefetch next cache line
+            __builtin_prefetch(static_cast<const char*>(src) + 64, 0, 3);
+        }
+        #endif
+        memcpy(dest, src, size);
+    }
+}
+
+// Stack-allocated secure buffer for small operations
+template<size_t Size>
+class StackSecureBuffer {
+private:
+    alignas(OptimizationConstants::ALIGNMENT) std::array<uint8_t, Size> data_;
+    
+public:
+    StackSecureBuffer() {
+        FastMemory::secure_clear_fast(data_.data(), Size);
+    }
+    
+    ~StackSecureBuffer() {
+        FastMemory::secure_clear_fast(data_.data(), Size);
+    }
+    
+    uint8_t* data() { return data_.data(); }
+    const uint8_t* data() const { return data_.data(); }
+    constexpr size_t size() const { return Size; }
+    
+    void write(const void* src, size_t len) {
+        if (len > Size) throw std::out_of_range("Write exceeds buffer size");
+        FastMemory::fast_copy(data_.data(), src, len);
+        if (len < Size) {
+            FastMemory::secure_clear_fast(data_.data() + len, Size - len);
+        }
+    }
+};
 
 #ifdef __linux__
 #include <sys/mman.h>
@@ -628,7 +711,212 @@ private:
 };
 
 
-// Synchronous version for small operations
+// Ultra-fast optimized synchronous crypto operations
+namespace FastCrypto {
+
+// Pre-allocated thread-local contexts for better performance
+thread_local EVP_PKEY_CTX* hkdf_ctx = nullptr;
+thread_local EVP_CIPHER_CTX* cipher_ctx = nullptr;
+
+// Initialize thread-local contexts
+void initThreadLocalContexts() {
+    if (!hkdf_ctx) {
+        hkdf_ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, nullptr);
+    }
+    if (!cipher_ctx) {
+        cipher_ctx = EVP_CIPHER_CTX_new();
+    }
+}
+
+// Cleanup thread-local contexts
+void cleanupThreadLocalContexts() {
+    if (hkdf_ctx) {
+        EVP_PKEY_CTX_free(hkdf_ctx);
+        hkdf_ctx = nullptr;
+    }
+    if (cipher_ctx) {
+        EVP_CIPHER_CTX_free(cipher_ctx);
+        cipher_ctx = nullptr;
+    }
+}
+
+// Optimized HKDF key derivation using stack buffers
+inline bool fastHKDF(const std::string& masterKey, const std::string& salt, 
+                     const std::string& info, uint8_t* keyMaterial, size_t keyLen) {
+    initThreadLocalContexts();
+    
+    if (EVP_PKEY_derive_init(hkdf_ctx) <= 0 ||
+        EVP_PKEY_CTX_set_hkdf_md(hkdf_ctx, EVP_sha256()) <= 0 ||
+        EVP_PKEY_CTX_set1_hkdf_salt(hkdf_ctx, 
+            reinterpret_cast<const unsigned char*>(salt.c_str()), salt.length()) <= 0 ||
+        EVP_PKEY_CTX_set1_hkdf_key(hkdf_ctx,
+            reinterpret_cast<const unsigned char*>(masterKey.c_str()), masterKey.length()) <= 0 ||
+        EVP_PKEY_CTX_add1_hkdf_info(hkdf_ctx,
+            reinterpret_cast<const unsigned char*>(info.c_str()), info.length()) <= 0) {
+        return false;
+    }
+
+    size_t outlen = keyLen;
+    return EVP_PKEY_derive(hkdf_ctx, keyMaterial, &outlen) > 0;
+}
+
+// Optimized AES-GCM decryption with minimal allocations
+inline bool fastAESGCMDecrypt(const uint8_t* key, const uint8_t* iv,
+                              const uint8_t* ciphertext, size_t ciphertext_len,
+                              const uint8_t* tag, size_t tag_len,
+                              uint8_t* plaintext, size_t* plaintext_len) {
+    initThreadLocalContexts();
+    
+    if (EVP_DecryptInit_ex(cipher_ctx, EVP_aes_256_gcm(), nullptr, key, iv) <= 0) {
+        return false;
+    }
+
+    if (EVP_CIPHER_CTX_ctrl(cipher_ctx, EVP_CTRL_GCM_SET_TAG, tag_len, 
+                           const_cast<uint8_t*>(tag)) <= 0) {
+        return false;
+    }
+
+    int len;
+    if (EVP_DecryptUpdate(cipher_ctx, plaintext, &len, ciphertext, ciphertext_len) <= 0) {
+        return false;
+    }
+
+    int finalLen;
+    if (EVP_DecryptFinal_ex(cipher_ctx, plaintext + len, &finalLen) <= 0) {
+        return false;
+    }
+
+    *plaintext_len = len + finalLen;
+    return true;
+}
+
+// Optimized HMAC-SHA256 with stack allocation
+inline void fastHMAC(const uint8_t* key, size_t key_len,
+                     const uint8_t* data, size_t data_len,
+                     uint8_t* result) {
+    unsigned int len = 32;
+    HMAC(EVP_sha256(), key, key_len, data, data_len, result, &len);
+}
+
+// Fast hex conversion using lookup table
+inline void fastToHex(const uint8_t* data, size_t len, char* hex) {
+    static const char hex_chars[] = "0123456789abcdef";
+    for (size_t i = 0; i < len; ++i) {
+        hex[i * 2] = hex_chars[data[i] >> 4];
+        hex[i * 2 + 1] = hex_chars[data[i] & 0x0F];
+    }
+    hex[len * 2] = '\0';
+}
+
+} // namespace FastCrypto
+
+// Ultra-optimized synchronous version for maximum performance
+Napi::Value DecryptAndVerifyFast(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 1 || !info[0].IsObject()) {
+        Napi::TypeError::New(env, "Expected object as first argument").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    Napi::Object params = info[0].As<Napi::Object>();
+    
+    try {
+        // Extract parameters - minimal string copying
+        std::string masterKey = params.Get("masterKey").As<Napi::String>().Utf8Value();
+        std::string salt = params.Get("salt").As<Napi::String>().Utf8Value();
+        std::string info = params.Get("info").As<Napi::String>().Utf8Value();
+        
+        Napi::Buffer<uint8_t> ciphertextBuf = params.Get("ciphertext").As<Napi::Buffer<uint8_t>>();
+        Napi::Buffer<uint8_t> tagBuf = params.Get("tag").As<Napi::Buffer<uint8_t>>();
+        
+        std::string stringToSign = params.Get("stringToSign").As<Napi::String>().Utf8Value();
+        std::string region = params.Get("region").As<Napi::String>().Utf8Value();
+        std::string service = params.Get("service").As<Napi::String>().Utf8Value();
+        std::string scopeDate = params.Get("scopeDate").As<Napi::String>().Utf8Value();
+        std::string expectedSignature = params.Get("expectedSignature").As<Napi::String>().Utf8Value();
+
+        // Use stack allocation for small buffers - much faster than heap allocation
+        StackSecureBuffer<44> keyMaterial;  // 32 bytes key + 12 bytes IV
+        StackSecureBuffer<32> hmac_result;
+        StackSecureBuffer<65> hex_buffer;   // 64 hex chars + null terminator
+        
+        // Step 1: Optimized HKDF key derivation
+        if (!FastCrypto::fastHKDF(masterKey, salt, info, keyMaterial.data(), 44)) {
+            Napi::Error::New(env, "HKDF derivation failed").ThrowAsJavaScriptException();
+            return env.Null();
+        }
+
+        const uint8_t* key = keyMaterial.data();
+        const uint8_t* iv = keyMaterial.data() + 32;
+
+        // Step 2: Optimized AES-GCM decryption
+        std::vector<uint8_t> plaintext(ciphertextBuf.Length());
+        size_t plaintext_len;
+        
+        if (!FastCrypto::fastAESGCMDecrypt(key, iv, 
+                                          ciphertextBuf.Data(), ciphertextBuf.Length(),
+                                          tagBuf.Data(), tagBuf.Length(),
+                                          plaintext.data(), &plaintext_len)) {
+            Napi::Error::New(env, "Decryption failed").ThrowAsJavaScriptException();
+            return env.Null();
+        }
+        
+        plaintext.resize(plaintext_len);
+
+        // Step 3: Optimized AWS v4 signature verification
+        // Use stack buffers for intermediate HMAC results
+        StackSecureBuffer<32> kDate, kRegion, kService, kSigning, signature;
+        
+        std::string kSecret = "AWS4" + std::string(reinterpret_cast<char*>(plaintext.data()), plaintext_len);
+        
+        // Chain HMAC operations with minimal allocations
+        FastCrypto::fastHMAC(reinterpret_cast<const uint8_t*>(kSecret.c_str()), kSecret.length(),
+                             reinterpret_cast<const uint8_t*>(scopeDate.c_str()), scopeDate.length(),
+                             kDate.data());
+        
+        FastCrypto::fastHMAC(kDate.data(), 32,
+                             reinterpret_cast<const uint8_t*>(region.c_str()), region.length(),
+                             kRegion.data());
+        
+        std::string serviceStr = service.empty() ? "s3" : service;
+        FastCrypto::fastHMAC(kRegion.data(), 32,
+                             reinterpret_cast<const uint8_t*>(serviceStr.c_str()), serviceStr.length(),
+                             kService.data());
+        
+        FastCrypto::fastHMAC(kService.data(), 32,
+                             reinterpret_cast<const uint8_t*>("aws4_request"), 12,
+                             kSigning.data());
+        
+        FastCrypto::fastHMAC(kSigning.data(), 32,
+                             reinterpret_cast<const uint8_t*>(stringToSign.c_str()), stringToSign.length(),
+                             signature.data());
+        
+        // Fast hex conversion
+        FastCrypto::fastToHex(signature.data(), 32, reinterpret_cast<char*>(hex_buffer.data()));
+        
+        bool signatureValid = (std::string(reinterpret_cast<char*>(hex_buffer.data()), 64) == expectedSignature);
+
+        // Clear sensitive data from stack
+        FastMemory::secure_clear_fast(const_cast<char*>(kSecret.c_str()), kSecret.length());
+
+        // Create result
+        Napi::Object result = Napi::Object::New(env);
+        result.Set("signatureValid", Napi::Boolean::New(env, signatureValid));
+        
+        if (signatureValid) {
+            result.Set("secretKey", Napi::Buffer<uint8_t>::Copy(env, plaintext.data(), plaintext_len));
+        }
+        
+        return result;
+        
+    } catch (const std::exception& e) {
+        Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+        return env.Null();
+    }
+}
+
+// Original synchronous version for compatibility
 Napi::Value DecryptAndVerifySync(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
 
@@ -640,9 +928,15 @@ Napi::Value DecryptAndVerifySync(const Napi::CallbackInfo& info) {
     Napi::Object params = info[0].As<Napi::Object>();
     
     try {
-        // Handle masterKey as Buffer
-        Napi::Buffer<uint8_t> masterKeyBuf = params.Get("masterKey").As<Napi::Buffer<uint8_t>>();
-        std::string masterKey(reinterpret_cast<const char*>(masterKeyBuf.Data()), masterKeyBuf.Length());
+        // Handle masterKey as either Buffer or String for compatibility
+        std::string masterKey;
+        Napi::Value masterKeyValue = params.Get("masterKey");
+        if (masterKeyValue.IsBuffer()) {
+            Napi::Buffer<uint8_t> masterKeyBuf = masterKeyValue.As<Napi::Buffer<uint8_t>>();
+            masterKey = std::string(reinterpret_cast<const char*>(masterKeyBuf.Data()), masterKeyBuf.Length());
+        } else {
+            masterKey = masterKeyValue.As<Napi::String>().Utf8Value();
+        }
         
         std::string salt = params.Get("salt").As<Napi::String>().Utf8Value();
         std::string info = params.Get("info").As<Napi::String>().Utf8Value();
@@ -837,15 +1131,29 @@ Napi::Value DecryptAndVerifyBase64Async(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+// Process cleanup on exit
+void processCleanup() {
+    FastCrypto::cleanupThreadLocalContexts();
+}
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
-    // Initialize process security settings on module load
-    initializeProcessSecurity();
+    // Initialize process security (simplified version)
+    #ifdef __linux__
+    prctl(PR_SET_DUMPABLE, 0);
+    prctl(PR_SET_NAME, "vault-crypto");
+    #endif
     
+    // Register cleanup handler
+    std::atexit(processCleanup);
+    
+    // Export all functions including the ultra-fast optimized version
     exports.Set("decryptAndVerifySync", Napi::Function::New(env, DecryptAndVerifySync));
+    exports.Set("decryptAndVerifyFast", Napi::Function::New(env, DecryptAndVerifyFast));
     exports.Set("decryptAndVerifyAsync", Napi::Function::New(env, DecryptAndVerifyAsync));
     exports.Set("decryptAndVerifyBase64Async", Napi::Function::New(env, DecryptAndVerifyBase64Async));
     exports.Set("getCacheStats", Napi::Function::New(env, GetCacheStats));
     exports.Set("clearCache", Napi::Function::New(env, ClearCache));
+    
     return exports;
 }
 

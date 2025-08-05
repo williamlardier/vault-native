@@ -15,6 +15,20 @@
       ],
       "cflags!": [ "-fno-exceptions" ],
       "cflags_cc!": [ "-fno-exceptions" ],
+      "cflags": [ 
+        "-mavx2", 
+        "<!(echo ${VAULT_CRYPTO_OPT_LEVEL:-'-O2'})", 
+        "-march=native", 
+        "-ftree-vectorize",
+        "-ffast-math"
+      ],
+      "cflags_cc": [ 
+        "-mavx2", 
+        "<!(echo ${VAULT_CRYPTO_OPT_LEVEL:-'-O2'})", 
+        "-march=native", 
+        "-ftree-vectorize",
+        "-ffast-math"
+      ],
       "xcode_settings": {
         "GCC_ENABLE_CPP_EXCEPTIONS": "YES",
         "CLANG_CXX_LIBRARY": "libc++",

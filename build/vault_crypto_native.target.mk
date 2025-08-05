@@ -25,6 +25,11 @@ CFLAGS_Debug := \
 	-Wall \
 	-Wextra \
 	-Wno-unused-parameter \
+	-mavx2 \
+	-O2 \
+	-march=native \
+	-ftree-vectorize \
+	-ffast-math \
 	-m64 \
 	-g \
 	-O0
@@ -36,7 +41,12 @@ CFLAGS_C_Debug :=
 CFLAGS_CC_Debug := \
 	-fno-rtti \
 	-fno-strict-aliasing \
-	-std=gnu++17
+	-std=gnu++17 \
+	-mavx2 \
+	-O2 \
+	-march=native \
+	-ftree-vectorize \
+	-ffast-math
 
 INCS_Debug := \
 	-I/home/william/.cache/node-gyp/22.17.1/include/node \
@@ -69,6 +79,11 @@ CFLAGS_Release := \
 	-Wall \
 	-Wextra \
 	-Wno-unused-parameter \
+	-mavx2 \
+	-O2 \
+	-march=native \
+	-ftree-vectorize \
+	-ffast-math \
 	-m64 \
 	-O3 \
 	-fno-omit-frame-pointer
@@ -80,7 +95,12 @@ CFLAGS_C_Release :=
 CFLAGS_CC_Release := \
 	-fno-rtti \
 	-fno-strict-aliasing \
-	-std=gnu++17
+	-std=gnu++17 \
+	-mavx2 \
+	-O2 \
+	-march=native \
+	-ftree-vectorize \
+	-ffast-math
 
 INCS_Release := \
 	-I/home/william/.cache/node-gyp/22.17.1/include/node \

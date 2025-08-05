@@ -498,6 +498,7 @@
     "init_version": "1.0.0",
     "init_license": "MIT",
     "version_tag_prefix": "v",
+    "yes": "true",
     "registry": "https://registry.yarnpkg.com",
     "ignore_scripts": "",
     "version_git_message": "v%s",
