@@ -7,6 +7,9 @@
 #include <vector>
 #include <memory>
 #include <cstring>
+#include <unordered_map>
+#include <chrono>
+#include <mutex>
 
 #ifdef __linux__
 #include <sys/mman.h>
@@ -109,6 +112,111 @@ void initializeProcessSecurity() {
     #endif
 }
 
+// Cache entry for storing decrypted secret keys
+struct CacheEntry {
+    std::vector<uint8_t> secretKey;
+    std::chrono::steady_clock::time_point expiry;
+    
+    CacheEntry(const std::vector<uint8_t>& key, std::chrono::seconds ttl) 
+        : secretKey(key), expiry(std::chrono::steady_clock::now() + ttl) {}
+    
+    ~CacheEntry() {
+        // Secure cleanup
+        OPENSSL_cleanse(secretKey.data(), secretKey.size());
+    }
+    
+    bool isExpired() const {
+        return std::chrono::steady_clock::now() >= expiry;
+    }
+};
+
+// Thread-safe cache for secret keys
+class SecretKeyCache {
+private:
+    std::unordered_map<std::string, std::unique_ptr<CacheEntry>> cache_;
+    mutable std::mutex mutex_;  // mutable so it can be locked in const methods
+    size_t maxSize_;
+    std::chrono::seconds defaultTtl_;
+    
+public:
+    SecretKeyCache(size_t maxSize = 10000, std::chrono::seconds ttl = std::chrono::seconds(3600)) 
+        : maxSize_(maxSize), defaultTtl_(ttl) {}
+    
+    ~SecretKeyCache() {
+        clear();
+    }
+    
+    // Generate cache key from parameters
+    std::string generateKey(const std::string& salt, const std::string& info, 
+                           const std::vector<uint8_t>& ciphertext, const std::vector<uint8_t>& tag) {
+        // Create a unique key based on the encrypted data parameters
+        std::string key = salt + "|" + info + "|";
+        key.append(reinterpret_cast<const char*>(ciphertext.data()), ciphertext.size());
+        key.append(reinterpret_cast<const char*>(tag.data()), tag.size());
+        return key;
+    }
+    
+    // Try to get cached secret key
+    bool get(const std::string& cacheKey, std::vector<uint8_t>& secretKey) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        
+        auto it = cache_.find(cacheKey);
+        if (it == cache_.end()) {
+            return false; // Cache miss
+        }
+        
+        if (it->second->isExpired()) {
+            cache_.erase(it);
+            return false; // Expired
+        }
+        
+        secretKey = it->second->secretKey;
+        return true; // Cache hit
+    }
+    
+    // Store secret key in cache
+    void put(const std::string& cacheKey, const std::vector<uint8_t>& secretKey) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        
+        // Remove expired entries and enforce size limit
+        cleanup();
+        
+        if (cache_.size() >= maxSize_) {
+            // Simple eviction: remove first entry (could be improved with LRU)
+            cache_.erase(cache_.begin());
+        }
+        
+        cache_[cacheKey] = std::make_unique<CacheEntry>(secretKey, defaultTtl_);
+    }
+    
+    // Clear all entries
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cache_.clear();
+    }
+    
+    // Clean up expired entries
+    void cleanup() {
+        auto it = cache_.begin();
+        while (it != cache_.end()) {
+            if (it->second->isExpired()) {
+                it = cache_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    
+    // Get cache statistics
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return cache_.size();
+    }
+};
+
+// Global cache instance
+static SecretKeyCache g_secretKeyCache;
+
 // Forward declaration and core implementation
 struct CryptoResult {
     bool success;
@@ -130,6 +238,60 @@ CryptoResult performDecryptAndVerify(const std::string& masterKey,
     CryptoResult result = {false, false, {}, ""};
     
     try {
+        // Try cache first
+        std::string cacheKey = g_secretKeyCache.generateKey(salt, info, ciphertext, tag);
+        std::vector<uint8_t> cachedSecretKey;
+        
+        if (g_secretKeyCache.get(cacheKey, cachedSecretKey)) {
+            // Cache hit! Skip decryption, just verify signature
+            result.plaintext = cachedSecretKey;
+            
+            // AWS v4 signature verification using cached secret key
+            SecureBuffer secretKeyBuf(cachedSecretKey.size());
+            secretKeyBuf.write(cachedSecretKey.data(), cachedSecretKey.size());
+            std::string secretKey(static_cast<char*>(secretKeyBuf.get()), cachedSecretKey.size());
+            
+            // AWS signature verification (same as below)
+            auto hmacSha256 = [](const std::vector<uint8_t>& key, const std::string& data) -> std::vector<uint8_t> {
+                std::vector<uint8_t> result(32);
+                unsigned int len = 32;
+                HMAC(EVP_sha256(), key.data(), key.size(),
+                     reinterpret_cast<const unsigned char*>(data.c_str()), data.length(),
+                     result.data(), &len);
+                return result;
+            };
+            
+            auto hmacSha256Str = [&hmacSha256](const std::string& key, const std::string& data) -> std::vector<uint8_t> {
+                return hmacSha256(std::vector<uint8_t>(key.begin(), key.end()), data);
+            };
+            
+            auto toHex = [](const std::vector<uint8_t>& data) -> std::string {
+                std::string hex;
+                hex.reserve(data.size() * 2);
+                for (uint8_t byte : data) {
+                    char buf[3];
+                    snprintf(buf, sizeof(buf), "%02x", byte);
+                    hex += buf;
+                }
+                return hex;
+            };
+            
+            // AWS4-HMAC-SHA256 signing key derivation
+            std::string kSecret = "AWS4" + secretKey;
+            std::vector<uint8_t> kDate = hmacSha256Str(kSecret, scopeDate);
+            std::vector<uint8_t> kRegion = hmacSha256(kDate, region);
+            std::vector<uint8_t> kService = hmacSha256(kRegion, service.empty() ? "s3" : service);
+            std::vector<uint8_t> kSigning = hmacSha256(kService, "aws4_request");
+            std::vector<uint8_t> signature = hmacSha256(kSigning, stringToSign);
+            
+            std::string calculatedSignature = toHex(signature);
+            result.signatureValid = (calculatedSignature == expectedSignature);
+            result.success = true;
+            
+            return result;
+        }
+        
+        // Cache miss - perform full decryption
         // Step 1: HKDF key derivation
         std::vector<uint8_t> keyMaterial(44); // 32 bytes key + 12 bytes IV
         
@@ -260,6 +422,11 @@ CryptoResult performDecryptAndVerify(const std::string& masterKey,
 
         // Note: secretKeyBuf will automatically clear the secret key when destructed
         result.success = true;
+        
+        // Cache the decrypted secret key for future use (only cache if signature is valid)
+        if (result.signatureValid) {
+            g_secretKeyCache.put(cacheKey, result.plaintext);
+        }
         
     } catch (const std::exception& e) {
         result.errorMessage = e.what();
@@ -438,12 +605,34 @@ Napi::Value DecryptAndVerifyAsync(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+// Get cache statistics
+Napi::Value GetCacheStats(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    
+    Napi::Object stats = Napi::Object::New(env);
+    stats.Set("size", Napi::Number::New(env, g_secretKeyCache.size()));
+    stats.Set("maxSize", Napi::Number::New(env, 10000)); // Could make this configurable
+    
+    return stats;
+}
+
+// Clear cache manually
+Napi::Value ClearCache(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    
+    g_secretKeyCache.clear();
+    
+    return env.Undefined();
+}
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     // Initialize process security settings on module load
     initializeProcessSecurity();
     
     exports.Set("decryptAndVerifySync", Napi::Function::New(env, DecryptAndVerifySync));
     exports.Set("decryptAndVerifyAsync", Napi::Function::New(env, DecryptAndVerifyAsync));
+    exports.Set("getCacheStats", Napi::Function::New(env, GetCacheStats));
+    exports.Set("clearCache", Napi::Function::New(env, ClearCache));
     return exports;
 }
 
