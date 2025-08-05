@@ -13,6 +13,7 @@
 #include <atomic>
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
+#include <cstdio>
 
 #ifdef __linux__
 #include <sys/mman.h>
@@ -225,6 +226,10 @@ static std::atomic<size_t> g_cacheHits{0};
 static std::atomic<size_t> g_cacheMisses{0};
 static std::atomic<size_t> g_cacheStores{0};
 
+// Periodic logging
+static std::atomic<size_t> g_totalCalls{0};
+static std::chrono::steady_clock::time_point g_lastLogTime = std::chrono::steady_clock::now();
+
 // Simple base64 decoder using OpenSSL
 std::vector<uint8_t> decodeBase64(const std::string& base64) {
     BIO *bio, *b64;
@@ -266,6 +271,37 @@ CryptoResult performDecryptAndVerify(const std::string& masterKey,
                                    const std::string& scopeDate,
                                    const std::string& expectedSignature) {
     CryptoResult result = {false, false, {}, ""};
+    
+    // Periodic cache logging for production monitoring
+    size_t totalCalls = g_totalCalls.fetch_add(1) + 1;
+    auto now = std::chrono::steady_clock::now();
+    static std::mutex logMutex;
+    
+    // Log every 100 calls OR every 30 seconds, whichever comes first
+    if (totalCalls % 100 == 0 || 
+        std::chrono::duration_cast<std::chrono::seconds>(now - g_lastLogTime).count() >= 30) {
+        std::lock_guard<std::mutex> lock(logMutex);
+        
+        // Double-check in case another thread already logged
+        if (totalCalls % 100 == 0 || 
+            std::chrono::duration_cast<std::chrono::seconds>(now - g_lastLogTime).count() >= 30) {
+            
+            size_t hits = g_cacheHits.load();
+            size_t misses = g_cacheMisses.load();
+            size_t stores = g_cacheStores.load();
+            size_t cacheSize = g_secretKeyCache.size();
+            
+            double hitRate = (hits + misses > 0) ? (double)hits / (hits + misses) : 0.0;
+            
+            // Log to stdout for production monitoring
+            printf("[VAULT-CRYPTO] Cache Stats: calls=%zu, hits=%zu, misses=%zu, stores=%zu, "
+                   "size=%zu, hit_rate=%.1f%%, cache_working=%s\n", 
+                   totalCalls, hits, misses, stores, cacheSize, hitRate * 100.0,
+                   (hits > 0 || stores == 0) ? "YES" : "NEEDS_CHECK");
+                   
+            g_lastLogTime = now;
+        }
+    }
     
     try {
         // Try cache first
