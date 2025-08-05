@@ -336,46 +336,6 @@ private:
     bool signatureValid_;
 };
 
-// Helper function to safely extract string from either String or Buffer
-std::string SafeGetStringParam(const Napi::Object& params, const char* key, Napi::Env env) {
-    Napi::Value value = params.Get(key);
-    
-    if (value.IsUndefined() || value.IsNull()) {
-        std::string errorMsg = std::string("Missing required parameter: ") + key;
-        Napi::TypeError::New(env, errorMsg).ThrowAsJavaScriptException();
-        return "";
-    }
-    
-    if (value.IsString()) {
-        return value.As<Napi::String>().Utf8Value();
-    } else if (value.IsBuffer()) {
-        Napi::Buffer<uint8_t> buffer = value.As<Napi::Buffer<uint8_t>>();
-        return std::string(reinterpret_cast<const char*>(buffer.Data()), buffer.Length());
-    } else {
-        std::string errorMsg = std::string("Parameter '") + key + "' must be a string or buffer";
-        Napi::TypeError::New(env, errorMsg).ThrowAsJavaScriptException();
-        return "";
-    }
-}
-
-// Helper function to safely extract buffer parameter
-Napi::Buffer<uint8_t> SafeGetBufferParam(const Napi::Object& params, const char* key, Napi::Env env) {
-    Napi::Value value = params.Get(key);
-    
-    if (value.IsUndefined() || value.IsNull()) {
-        std::string errorMsg = std::string("Missing required parameter: ") + key;
-        Napi::TypeError::New(env, errorMsg).ThrowAsJavaScriptException();
-        return Napi::Buffer<uint8_t>();
-    }
-    
-    if (!value.IsBuffer()) {
-        std::string errorMsg = std::string("Parameter '") + key + "' must be a buffer";
-        Napi::TypeError::New(env, errorMsg).ThrowAsJavaScriptException();
-        return Napi::Buffer<uint8_t>();
-    }
-    
-    return value.As<Napi::Buffer<uint8_t>>();
-}
 
 // Synchronous version for small operations
 Napi::Value DecryptAndVerifySync(const Napi::CallbackInfo& info) {
