@@ -221,37 +221,40 @@ public:
 // Global cache instance
 static SecretKeyCache g_secretKeyCache;
 
-// Signature cache for AWS signature verification
-class SignatureCache {
+// Signing key cache - cache intermediate signing keys for AWS signature computation
+class SigningKeyCache {
 private:
-    struct SignatureCacheEntry {
-        std::string signature;
+    struct SigningKeyCacheEntry {
+        std::vector<uint8_t> signingKey;
         std::chrono::steady_clock::time_point expiry;
         
-        SignatureCacheEntry(const std::string& sig, std::chrono::seconds ttl) 
-            : signature(sig), expiry(std::chrono::steady_clock::now() + ttl) {}
+        SigningKeyCacheEntry(const std::vector<uint8_t>& key, std::chrono::seconds ttl) 
+            : signingKey(key), expiry(std::chrono::steady_clock::now() + ttl) {}
+        
+        ~SigningKeyCacheEntry() {
+            OPENSSL_cleanse(signingKey.data(), signingKey.size());
+        }
         
         bool isExpired() const {
             return std::chrono::steady_clock::now() >= expiry;
         }
     };
     
-    std::unordered_map<std::string, std::unique_ptr<SignatureCacheEntry>> cache_;
+    std::unordered_map<std::string, std::unique_ptr<SigningKeyCacheEntry>> cache_;
     mutable std::mutex mutex_;
     size_t maxSize_;
     std::chrono::seconds defaultTtl_;
     
 public:
-    SignatureCache(size_t maxSize = 5000, std::chrono::seconds ttl = std::chrono::seconds(1800)) 
+    SigningKeyCache(size_t maxSize = 1000, std::chrono::seconds ttl = std::chrono::seconds(3600)) 
         : maxSize_(maxSize), defaultTtl_(ttl) {}
     
-    std::string generateKey(const std::string& secretKey, const std::string& stringToSign, 
-                           const std::string& region, const std::string& service, 
-                           const std::string& scopeDate) {
-        return secretKey + "|" + stringToSign + "|" + region + "|" + service + "|" + scopeDate;
+    std::string generateKey(const std::string& secretKey, const std::string& scopeDate, 
+                           const std::string& region, const std::string& service) {
+        return secretKey + "|" + scopeDate + "|" + region + "|" + service;
     }
     
-    bool get(const std::string& cacheKey, std::string& signature) {
+    bool get(const std::string& cacheKey, std::vector<uint8_t>& signingKey) {
         std::lock_guard<std::mutex> lock(mutex_);
         
         auto it = cache_.find(cacheKey);
@@ -264,11 +267,11 @@ public:
             return false;
         }
         
-        signature = it->second->signature;
+        signingKey = it->second->signingKey;
         return true;
     }
     
-    void put(const std::string& cacheKey, const std::string& signature) {
+    void put(const std::string& cacheKey, const std::vector<uint8_t>& signingKey) {
         std::lock_guard<std::mutex> lock(mutex_);
         
         cleanup();
@@ -277,7 +280,7 @@ public:
             cache_.erase(cache_.begin());
         }
         
-        cache_[cacheKey] = std::make_unique<SignatureCacheEntry>(signature, defaultTtl_);
+        cache_[cacheKey] = std::make_unique<SigningKeyCacheEntry>(signingKey, defaultTtl_);
     }
     
     void cleanup() {
@@ -302,33 +305,19 @@ public:
     }
 };
 
-static SignatureCache g_signatureCache;
+static SigningKeyCache g_signingKeyCache;
 
 // Cache hit/miss counters for debugging
 static std::atomic<size_t> g_cacheHits{0};
 static std::atomic<size_t> g_cacheMisses{0};
 static std::atomic<size_t> g_cacheStores{0};
-static std::atomic<size_t> g_sigCacheHits{0};
-static std::atomic<size_t> g_sigCacheMisses{0};
+static std::atomic<size_t> g_signingKeyHits{0};
+static std::atomic<size_t> g_signingKeyMisses{0};
 
-// Periodic logging
-static std::atomic<size_t> g_totalCalls{0};
-static std::chrono::steady_clock::time_point g_lastLogTime = std::chrono::steady_clock::now();
-
-// Optimized AWS signature computation with caching
+// Optimized AWS signature computation with signing key caching
 std::string computeAWSSignature(const std::string& secretKey, const std::string& stringToSign,
                                const std::string& region, const std::string& service, 
                                const std::string& scopeDate) {
-    // Check signature cache first
-    std::string sigCacheKey = g_signatureCache.generateKey(secretKey, stringToSign, region, service, scopeDate);
-    std::string cachedSignature;
-    
-    if (g_signatureCache.get(sigCacheKey, cachedSignature)) {
-        g_sigCacheHits.fetch_add(1);
-        return cachedSignature;
-    }
-    
-    g_sigCacheMisses.fetch_add(1);
     
     // Helper functions for AWS signature calculation
     auto hmacSha256 = [](const std::vector<uint8_t>& key, const std::string& data) -> std::vector<uint8_t> {
@@ -344,31 +333,44 @@ std::string computeAWSSignature(const std::string& secretKey, const std::string&
         return hmacSha256(std::vector<uint8_t>(key.begin(), key.end()), data);
     };
     
-    auto toHex = [](const std::vector<uint8_t>& data) -> std::string {
+    // Fast hex conversion with lookup table
+    static const char hex_chars[] = "0123456789abcdef";
+    auto toHexFast = [](const std::vector<uint8_t>& data) -> std::string {
         std::string hex;
         hex.reserve(data.size() * 2);
         for (uint8_t byte : data) {
-            char buf[3];
-            snprintf(buf, sizeof(buf), "%02x", byte);
-            hex += buf;
+            hex += hex_chars[byte >> 4];
+            hex += hex_chars[byte & 0x0F];
         }
         return hex;
     };
     
-    // AWS4-HMAC-SHA256 signing key derivation
-    std::string kSecret = "AWS4" + secretKey;
-    std::vector<uint8_t> kDate = hmacSha256Str(kSecret, scopeDate);
-    std::vector<uint8_t> kRegion = hmacSha256(kDate, region);
-    std::vector<uint8_t> kService = hmacSha256(kRegion, service.empty() ? "s3" : service);
-    std::vector<uint8_t> kSigning = hmacSha256(kService, "aws4_request");
+    // Check signing key cache first (caches the expensive 4-step key derivation)
+    std::string signingKeyCacheKey = g_signingKeyCache.generateKey(secretKey, scopeDate, region, service);
+    std::vector<uint8_t> kSigning;
+    
+    if (g_signingKeyCache.get(signingKeyCacheKey, kSigning)) {
+        // Cache hit! Skip the 4 expensive HMAC operations
+        g_signingKeyHits.fetch_add(1);
+    } else {
+        // Cache miss - compute the signing key
+        g_signingKeyMisses.fetch_add(1);
+        
+        // AWS4-HMAC-SHA256 signing key derivation (4 HMAC operations)
+        std::string kSecret = "AWS4" + secretKey;
+        std::vector<uint8_t> kDate = hmacSha256Str(kSecret, scopeDate);
+        std::vector<uint8_t> kRegion = hmacSha256(kDate, region);
+        std::vector<uint8_t> kService = hmacSha256(kRegion, service.empty() ? "s3" : service);
+        kSigning = hmacSha256(kService, "aws4_request");
+        
+        // Cache the signing key for future use
+        g_signingKeyCache.put(signingKeyCacheKey, kSigning);
+    }
+    
+    // Final signature computation (only 1 HMAC operation)
     std::vector<uint8_t> signature = hmacSha256(kSigning, stringToSign);
     
-    std::string calculatedSignature = toHex(signature);
-    
-    // Cache the computed signature
-    g_signatureCache.put(sigCacheKey, calculatedSignature);
-    
-    return calculatedSignature;
+    return toHexFast(signature);
 }
 
 // Simple base64 decoder using OpenSSL
@@ -413,45 +415,7 @@ CryptoResult performDecryptAndVerify(const std::string& masterKey,
                                    const std::string& scopeDate,
                                    const std::string& expectedSignature) {
     CryptoResult result = {false, false, {}, "", false};
-    
-    // Periodic cache logging for production monitoring
-    size_t totalCalls = g_totalCalls.fetch_add(1) + 1;
-    auto now = std::chrono::steady_clock::now();
-    static std::mutex logMutex;
-    
-    // Log every 100 calls OR every 30 seconds, whichever comes first
-    if (totalCalls % 100 == 0 || 
-        std::chrono::duration_cast<std::chrono::seconds>(now - g_lastLogTime).count() >= 30) {
-        std::lock_guard<std::mutex> lock(logMutex);
-        
-        // Double-check in case another thread already logged
-        if (totalCalls % 100 == 0 || 
-            std::chrono::duration_cast<std::chrono::seconds>(now - g_lastLogTime).count() >= 30) {
-            
-            size_t hits = g_cacheHits.load();
-            size_t misses = g_cacheMisses.load();
-            size_t stores = g_cacheStores.load();
-            size_t cacheSize = g_secretKeyCache.size();
-            
-            size_t sigHits = g_sigCacheHits.load();
-            size_t sigMisses = g_sigCacheMisses.load();
-            size_t sigCacheSize = g_signatureCache.size();
-            
-            double hitRate = (hits + misses > 0) ? (double)hits / (hits + misses) : 0.0;
-            double sigHitRate = (sigHits + sigMisses > 0) ? (double)sigHits / (sigHits + sigMisses) : 0.0;
-            
-            // Log to stdout for production monitoring
-            printf("[VAULT-CRYPTO] Cache Stats: calls=%zu, key_cache(hits=%zu, misses=%zu, stores=%zu, "
-                   "size=%zu, hit_rate=%.1f%%), sig_cache(hits=%zu, misses=%zu, size=%zu, hit_rate=%.1f%%), "
-                   "cache_working=%s\n", 
-                   totalCalls, hits, misses, stores, cacheSize, hitRate * 100.0,
-                   sigHits, sigMisses, sigCacheSize, sigHitRate * 100.0,
-                   (hits > 0 || stores == 0) ? "YES" : "NEEDS_CHECK");
-                   
-            g_lastLogTime = now;
-        }
-    }
-    
+
     try {
         // Try cache first
         std::string cacheKey = g_secretKeyCache.generateKey(salt, info, ciphertext, tag);
@@ -775,9 +739,9 @@ Napi::Value GetCacheStats(const Napi::CallbackInfo& info) {
     size_t stores = g_cacheStores.load();
     size_t total = hits + misses;
     
-    size_t sigHits = g_sigCacheHits.load();
-    size_t sigMisses = g_sigCacheMisses.load();
-    size_t sigTotal = sigHits + sigMisses;
+    size_t sigKeyHits = g_signingKeyHits.load();
+    size_t sigKeyMisses = g_signingKeyMisses.load();
+    size_t sigKeyTotal = sigKeyHits + sigKeyMisses;
     
     Napi::Object stats = Napi::Object::New(env);
     
@@ -791,17 +755,17 @@ Napi::Value GetCacheStats(const Napi::CallbackInfo& info) {
     secretKeyStats.Set("total", Napi::Number::New(env, total));
     secretKeyStats.Set("hitRate", Napi::Number::New(env, total > 0 ? (double)hits / total : 0.0));
     
-    // Signature cache stats
-    Napi::Object signatureStats = Napi::Object::New(env);
-    signatureStats.Set("size", Napi::Number::New(env, g_signatureCache.size()));
-    signatureStats.Set("maxSize", Napi::Number::New(env, 5000));
-    signatureStats.Set("hits", Napi::Number::New(env, sigHits));
-    signatureStats.Set("misses", Napi::Number::New(env, sigMisses));
-    signatureStats.Set("total", Napi::Number::New(env, sigTotal));
-    signatureStats.Set("hitRate", Napi::Number::New(env, sigTotal > 0 ? (double)sigHits / sigTotal : 0.0));
+    // Signing key cache stats
+    Napi::Object signingKeyStats = Napi::Object::New(env);
+    signingKeyStats.Set("size", Napi::Number::New(env, g_signingKeyCache.size()));
+    signingKeyStats.Set("maxSize", Napi::Number::New(env, 1000));
+    signingKeyStats.Set("hits", Napi::Number::New(env, sigKeyHits));
+    signingKeyStats.Set("misses", Napi::Number::New(env, sigKeyMisses));
+    signingKeyStats.Set("total", Napi::Number::New(env, sigKeyTotal));
+    signingKeyStats.Set("hitRate", Napi::Number::New(env, sigKeyTotal > 0 ? (double)sigKeyHits / sigKeyTotal : 0.0));
     
     stats.Set("secretKey", secretKeyStats);
-    stats.Set("signature", signatureStats);
+    stats.Set("signingKey", signingKeyStats);
     
     // Legacy compatibility - keep old format at root level
     stats.Set("size", Napi::Number::New(env, g_secretKeyCache.size()));
@@ -820,7 +784,7 @@ Napi::Value ClearCache(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     
     g_secretKeyCache.clear();
-    g_signatureCache.clear();
+    g_signingKeyCache.clear();
     
     return env.Undefined();
 }
