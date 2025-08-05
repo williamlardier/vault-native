@@ -336,6 +336,47 @@ private:
     bool signatureValid_;
 };
 
+// Helper function to safely extract string from either String or Buffer
+std::string SafeGetStringParam(const Napi::Object& params, const char* key, Napi::Env env) {
+    Napi::Value value = params.Get(key);
+    
+    if (value.IsUndefined() || value.IsNull()) {
+        std::string errorMsg = std::string("Missing required parameter: ") + key;
+        Napi::TypeError::New(env, errorMsg).ThrowAsJavaScriptException();
+        return "";
+    }
+    
+    if (value.IsString()) {
+        return value.As<Napi::String>().Utf8Value();
+    } else if (value.IsBuffer()) {
+        Napi::Buffer<uint8_t> buffer = value.As<Napi::Buffer<uint8_t>>();
+        return std::string(reinterpret_cast<const char*>(buffer.Data()), buffer.Length());
+    } else {
+        std::string errorMsg = std::string("Parameter '") + key + "' must be a string or buffer";
+        Napi::TypeError::New(env, errorMsg).ThrowAsJavaScriptException();
+        return "";
+    }
+}
+
+// Helper function to safely extract buffer parameter
+Napi::Buffer<uint8_t> SafeGetBufferParam(const Napi::Object& params, const char* key, Napi::Env env) {
+    Napi::Value value = params.Get(key);
+    
+    if (value.IsUndefined() || value.IsNull()) {
+        std::string errorMsg = std::string("Missing required parameter: ") + key;
+        Napi::TypeError::New(env, errorMsg).ThrowAsJavaScriptException();
+        return Napi::Buffer<uint8_t>();
+    }
+    
+    if (!value.IsBuffer()) {
+        std::string errorMsg = std::string("Parameter '") + key + "' must be a buffer";
+        Napi::TypeError::New(env, errorMsg).ThrowAsJavaScriptException();
+        return Napi::Buffer<uint8_t>();
+    }
+    
+    return value.As<Napi::Buffer<uint8_t>>();
+}
+
 // Synchronous version for small operations
 Napi::Value DecryptAndVerifySync(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
@@ -348,7 +389,10 @@ Napi::Value DecryptAndVerifySync(const Napi::CallbackInfo& info) {
     Napi::Object params = info[0].As<Napi::Object>();
     
     try {
-        std::string masterKey = params.Get("masterKey").As<Napi::String>().Utf8Value();
+        // Handle masterKey as Buffer
+        Napi::Buffer<uint8_t> masterKeyBuf = params.Get("masterKey").As<Napi::Buffer<uint8_t>>();
+        std::string masterKey(reinterpret_cast<const char*>(masterKeyBuf.Data()), masterKeyBuf.Length());
+        
         std::string salt = params.Get("salt").As<Napi::String>().Utf8Value();
         std::string info = params.Get("info").As<Napi::String>().Utf8Value();
         
@@ -401,7 +445,10 @@ Napi::Value DecryptAndVerifyAsync(const Napi::CallbackInfo& info) {
     Napi::Function callback = info[1].As<Napi::Function>();
     
     try {
-        std::string masterKey = params.Get("masterKey").As<Napi::String>().Utf8Value();
+        // Handle masterKey as Buffer
+        Napi::Buffer<uint8_t> masterKeyBuf = params.Get("masterKey").As<Napi::Buffer<uint8_t>>();
+        std::string masterKey(reinterpret_cast<const char*>(masterKeyBuf.Data()), masterKeyBuf.Length());
+        
         std::string salt = params.Get("salt").As<Napi::String>().Utf8Value();
         std::string info = params.Get("info").As<Napi::String>().Utf8Value();
         
