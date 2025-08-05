@@ -10,6 +10,9 @@
 #include <unordered_map>
 #include <chrono>
 #include <mutex>
+#include <atomic>
+#include <openssl/bio.h>
+#include <openssl/buffer.h>
 
 #ifdef __linux__
 #include <sys/mman.h>
@@ -217,6 +220,33 @@ public:
 // Global cache instance
 static SecretKeyCache g_secretKeyCache;
 
+// Cache hit/miss counters for debugging
+static std::atomic<size_t> g_cacheHits{0};
+static std::atomic<size_t> g_cacheMisses{0};
+static std::atomic<size_t> g_cacheStores{0};
+
+// Simple base64 decoder using OpenSSL
+std::vector<uint8_t> decodeBase64(const std::string& base64) {
+    BIO *bio, *b64;
+    std::vector<uint8_t> result(base64.length());
+    
+    b64 = BIO_new(BIO_f_base64());
+    bio = BIO_new_mem_buf(base64.c_str(), base64.length());
+    bio = BIO_push(b64, bio);
+    BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL);
+    
+    int decoded_size = BIO_read(bio, result.data(), base64.length());
+    BIO_free_all(bio);
+    
+    if (decoded_size > 0) {
+        result.resize(decoded_size);
+    } else {
+        result.clear();
+    }
+    
+    return result;
+}
+
 // Forward declaration and core implementation
 struct CryptoResult {
     bool success;
@@ -244,6 +274,7 @@ CryptoResult performDecryptAndVerify(const std::string& masterKey,
         
         if (g_secretKeyCache.get(cacheKey, cachedSecretKey)) {
             // Cache hit! Skip decryption, just verify signature
+            g_cacheHits.fetch_add(1);
             result.plaintext = cachedSecretKey;
             
             // AWS v4 signature verification using cached secret key
@@ -292,6 +323,8 @@ CryptoResult performDecryptAndVerify(const std::string& masterKey,
         }
         
         // Cache miss - perform full decryption
+        g_cacheMisses.fetch_add(1);
+        
         // Step 1: HKDF key derivation
         std::vector<uint8_t> keyMaterial(44); // 32 bytes key + 12 bytes IV
         
@@ -377,6 +410,11 @@ CryptoResult performDecryptAndVerify(const std::string& masterKey,
         result.plaintext.resize(len + finalLen);
         EVP_CIPHER_CTX_free(ctx);
 
+        // ✅ CACHE IMMEDIATELY AFTER SUCCESSFUL DECRYPTION (before signature verification)
+        // This ensures we cache the expensive HKDF+AES-GCM work even if signature fails
+        g_secretKeyCache.put(cacheKey, result.plaintext);
+        g_cacheStores.fetch_add(1);
+
         // Note: key and iv SecureBuffers will automatically clear themselves when destructed
 
         // Step 3: AWS v4 signature verification using secure memory
@@ -423,10 +461,7 @@ CryptoResult performDecryptAndVerify(const std::string& masterKey,
         // Note: secretKeyBuf will automatically clear the secret key when destructed
         result.success = true;
         
-        // Cache the decrypted secret key for future use (only cache if signature is valid)
-        if (result.signatureValid) {
-            g_secretKeyCache.put(cacheKey, result.plaintext);
-        }
+        // NOTE: Caching already done immediately after decryption above
         
     } catch (const std::exception& e) {
         result.errorMessage = e.what();
@@ -605,13 +640,23 @@ Napi::Value DecryptAndVerifyAsync(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
-// Get cache statistics
+// Get detailed cache statistics with hit/miss ratios
 Napi::Value GetCacheStats(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     
+    size_t hits = g_cacheHits.load();
+    size_t misses = g_cacheMisses.load();
+    size_t stores = g_cacheStores.load();
+    size_t total = hits + misses;
+    
     Napi::Object stats = Napi::Object::New(env);
     stats.Set("size", Napi::Number::New(env, g_secretKeyCache.size()));
-    stats.Set("maxSize", Napi::Number::New(env, 10000)); // Could make this configurable
+    stats.Set("maxSize", Napi::Number::New(env, 10000));
+    stats.Set("hits", Napi::Number::New(env, hits));
+    stats.Set("misses", Napi::Number::New(env, misses));
+    stats.Set("stores", Napi::Number::New(env, stores));
+    stats.Set("total", Napi::Number::New(env, total));
+    stats.Set("hitRate", Napi::Number::New(env, total > 0 ? (double)hits / total : 0.0));
     
     return stats;
 }
@@ -625,12 +670,61 @@ Napi::Value ClearCache(const Napi::CallbackInfo& info) {
     return env.Undefined();
 }
 
+// Optimized version that accepts base64 strings directly (minimal serialization)
+Napi::Value DecryptAndVerifyBase64Async(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 2 || !info[0].IsObject() || !info[1].IsFunction()) {
+        Napi::TypeError::New(env, "Expected (object, callback)").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    Napi::Object params = info[0].As<Napi::Object>();
+    Napi::Function callback = info[1].As<Napi::Function>();
+    
+    try {
+        // Handle masterKey as Buffer
+        Napi::Buffer<uint8_t> masterKeyBuf = params.Get("masterKey").As<Napi::Buffer<uint8_t>>();
+        std::string masterKey(reinterpret_cast<const char*>(masterKeyBuf.Data()), masterKeyBuf.Length());
+        
+        std::string salt = params.Get("salt").As<Napi::String>().Utf8Value();
+        std::string info = params.Get("info").As<Napi::String>().Utf8Value();
+        
+        // Accept base64 strings directly - MUCH more efficient!
+        std::string ciphertextBase64 = params.Get("ciphertextBase64").As<Napi::String>().Utf8Value();
+        std::string tagBase64 = params.Get("tagBase64").As<Napi::String>().Utf8Value();
+        
+        // Decode in C++ (faster than JS Buffer.from)
+        std::vector<uint8_t> ciphertext = decodeBase64(ciphertextBase64);
+        std::vector<uint8_t> tag = decodeBase64(tagBase64);
+        
+        std::string stringToSign = params.Get("stringToSign").As<Napi::String>().Utf8Value();
+        std::string region = params.Get("region").As<Napi::String>().Utf8Value();
+        std::string service = params.Get("service").As<Napi::String>().Utf8Value();
+        std::string scopeDate = params.Get("scopeDate").As<Napi::String>().Utf8Value();
+        std::string expectedSignature = params.Get("expectedSignature").As<Napi::String>().Utf8Value();
+
+        VaultCryptoWorker* worker = new VaultCryptoWorker(
+            callback, masterKey, salt, info, ciphertext, tag,
+            stringToSign, region, service, scopeDate, expectedSignature
+        );
+        
+        worker->Queue();
+        
+    } catch (const std::exception& e) {
+        Napi::Error::New(env, e.what()).ThrowAsJavaScriptException();
+    }
+
+    return env.Undefined();
+}
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     // Initialize process security settings on module load
     initializeProcessSecurity();
     
     exports.Set("decryptAndVerifySync", Napi::Function::New(env, DecryptAndVerifySync));
     exports.Set("decryptAndVerifyAsync", Napi::Function::New(env, DecryptAndVerifyAsync));
+    exports.Set("decryptAndVerifyBase64Async", Napi::Function::New(env, DecryptAndVerifyBase64Async));
     exports.Set("getCacheStats", Napi::Function::New(env, GetCacheStats));
     exports.Set("clearCache", Napi::Function::New(env, ClearCache));
     return exports;
