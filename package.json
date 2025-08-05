@@ -1,0 +1,19 @@
+{
+  "name": "vault-crypto-native",
+  "version": "1.0.0",
+  "description": "Native crypto operations for Vault authentication",
+  "main": "index.js",
+  "private": true,
+  "scripts": {
+    "build": "node-gyp rebuild",
+    "clean": "node-gyp clean",
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "node-addon-api": "^7.0.0"
+  },
+  "devDependencies": {
+    "node-gyp": "^10.0.0"
+  },
+  "gypfile": true
+}
