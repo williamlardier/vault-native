@@ -1,6 +1,6 @@
 {
   "name": "vault-crypto-native",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "Native crypto operations for Vault authentication",
   "main": "index.js",
   "private": true,
