@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <array>
 #include <thread>
+#include <algorithm>
 
 #ifdef __x86_64__
 #include <immintrin.h>
@@ -27,6 +28,34 @@ namespace OptimizationConstants {
     static constexpr size_t SMALL_BUFFER_THRESHOLD = 1024; // 1KB
     static constexpr size_t STACK_BUFFER_SIZE = 512;
     static constexpr size_t ALIGNMENT = 32; // For SIMD operations
+    static constexpr size_t MLOCK_THRESHOLD = 1024; // Only mlock buffers >= 1KB
+    static constexpr bool DISABLE_MLOCK = false; // Set to true to disable mlock entirely
+}
+
+// Runtime mlock configuration
+namespace MlockConfig {
+    static std::atomic<bool> disable_mlock{OptimizationConstants::DISABLE_MLOCK};
+    static std::atomic<size_t> mlock_threshold{OptimizationConstants::MLOCK_THRESHOLD};
+    
+    bool shouldMlock(size_t size) {
+        return !disable_mlock.load() && size >= mlock_threshold.load();
+    }
+    
+    void setDisableMlock(bool disable) {
+        disable_mlock.store(disable);
+    }
+    
+    void setMlockThreshold(size_t threshold) {
+        mlock_threshold.store(threshold);
+    }
+    
+    bool isDisabled() {
+        return disable_mlock.load();
+    }
+    
+    size_t getThreshold() {
+        return mlock_threshold.load();
+    }
 }
 
 // High-performance memory operations
@@ -104,23 +133,149 @@ public:
 #include <unistd.h>
 #endif
 
+// Simple buffer pool for frequently used sizes to avoid repeated mlock/munlock
+class SecureBufferPool {
+private:
+    struct PooledBuffer {
+        void* data;
+        size_t size;
+        size_t allocated_size;
+        bool locked;
+        std::chrono::steady_clock::time_point last_used;
+    };
+    
+    std::unordered_map<size_t, std::vector<PooledBuffer>> pools_;
+    mutable std::mutex mutex_;
+    static constexpr size_t MAX_POOLED_BUFFERS_PER_SIZE = 8;
+    static constexpr std::chrono::seconds BUFFER_TTL{30}; // 30 seconds
+    
+public:
+    ~SecureBufferPool() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& [size, buffers] : pools_) {
+            for (auto& buf : buffers) {
+                if (buf.data) {
+                    OPENSSL_cleanse(buf.data, buf.size);
+                    if (buf.locked) {
+                        #ifdef __linux__
+                        munlock(buf.data, buf.allocated_size);
+                        #endif
+                    }
+                    free(buf.data);
+                }
+            }
+        }
+    }
+    
+    // Try to get a buffer from the pool
+    PooledBuffer* tryGet(size_t size) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = pools_.find(size);
+        if (it != pools_.end() && !it->second.empty()) {
+            auto& buffer = it->second.back();
+            buffer.last_used = std::chrono::steady_clock::now();
+            PooledBuffer* result = new PooledBuffer(std::move(buffer));
+            it->second.pop_back();
+            return result;
+        }
+        return nullptr;
+    }
+    
+    // Return a buffer to the pool
+    void returnBuffer(size_t size, void* data, size_t allocated_size, bool locked) {
+        if (!data) return;
+        
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto& buffers = pools_[size];
+        
+        // Clean up old buffers first
+        auto now = std::chrono::steady_clock::now();
+        buffers.erase(std::remove_if(buffers.begin(), buffers.end(),
+            [&](const PooledBuffer& buf) {
+                if (now - buf.last_used > BUFFER_TTL) {
+                    if (buf.data) {
+                        OPENSSL_cleanse(buf.data, buf.size);
+                        if (buf.locked) {
+                            #ifdef __linux__
+                            munlock(buf.data, buf.allocated_size);
+                            #endif
+                        }
+                        free(buf.data);
+                    }
+                    return true;
+                }
+                return false;
+            }), buffers.end());
+        
+        // Add to pool if there's space
+        if (buffers.size() < MAX_POOLED_BUFFERS_PER_SIZE) {
+            // Clear the buffer before pooling
+            OPENSSL_cleanse(data, size);
+            buffers.push_back({data, size, allocated_size, locked, now});
+        } else {
+            // Pool is full, free the buffer
+            OPENSSL_cleanse(data, size);
+            if (locked) {
+                #ifdef __linux__
+                munlock(data, allocated_size);
+                #endif
+            }
+            free(data);
+        }
+    }
+    
+    size_t getPoolSize() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        size_t total = 0;
+        for (const auto& [size, buffers] : pools_) {
+            total += buffers.size();
+        }
+        return total;
+    }
+};
+
+static SecureBufferPool g_bufferPool;
+
 // Secure memory management for sensitive data
 class SecureBuffer {
 private:
     void* data_;
     size_t size_;
+    size_t allocated_size_; // Actual allocated size (may be page-aligned)
     bool locked_;
     
 public:
-    SecureBuffer(size_t size) : size_(size), locked_(false) {
-        // Allocate page-aligned memory for mlock compatibility
-        #ifdef __linux__
-        size_t page_size = getpagesize();
-        size_t aligned_size = ((size + page_size - 1) / page_size) * page_size;
-        data_ = aligned_alloc(page_size, aligned_size);
-        #else
-        data_ = malloc(size);
-        #endif
+    SecureBuffer(size_t size) : size_(size), allocated_size_(size), locked_(false) {
+        // Try to get from buffer pool first (only for commonly used sizes)
+        if (size <= 4096) { // Only pool small-medium buffers
+            auto* pooled = g_bufferPool.tryGet(size);
+            if (pooled) {
+                data_ = pooled->data;
+                allocated_size_ = pooled->allocated_size;
+                locked_ = pooled->locked;
+                delete pooled;
+                // Clear the buffer before use
+                OPENSSL_cleanse(data_, size_);
+                return;
+            }
+        }
+        
+        // For small buffers, use regular malloc (no mlock overhead)
+        bool should_mlock = MlockConfig::shouldMlock(size);
+        
+        if (should_mlock) {
+            // Allocate page-aligned memory for mlock compatibility
+            #ifdef __linux__
+            size_t page_size = getpagesize();
+            allocated_size_ = ((size + page_size - 1) / page_size) * page_size;
+            data_ = aligned_alloc(page_size, allocated_size_);
+            #else
+            data_ = malloc(size);
+            #endif
+        } else {
+            // Simple allocation for small buffers
+            data_ = malloc(size);
+        }
         
         if (!data_) {
             throw std::bad_alloc();
@@ -130,23 +285,32 @@ public:
         OPENSSL_cleanse(data_, size_);
         
         #ifdef __linux__
-        // Lock memory to prevent swapping to disk
-        if (mlock(data_, size_) == 0) {
-            locked_ = true;
+        if (should_mlock) {
+            // Lock memory to prevent swapping to disk (only for large buffers)
+            if (mlock(data_, allocated_size_) == 0) {
+                locked_ = true;
+            }
+            // Note: We don't throw on mlock failure as it might not have permissions
+            // but we track the state for cleanup
         }
-        // Note: We don't throw on mlock failure as it might not have permissions
-        // but we track the state for cleanup
         #endif
     }
     
     ~SecureBuffer() {
         if (data_) {
+            // Try to return to buffer pool first (only for commonly used sizes)
+            if (size_ <= 4096) {
+                g_bufferPool.returnBuffer(size_, data_, allocated_size_, locked_);
+                data_ = nullptr; // Buffer now owned by pool
+                return;
+            }
+            
             // Always clear sensitive data first
             OPENSSL_cleanse(data_, size_);
             
             #ifdef __linux__
             if (locked_) {
-                munlock(data_, size_);
+                munlock(data_, allocated_size_);
             }
             #endif
             
@@ -559,9 +723,9 @@ CryptoResult performDecryptAndVerify(const std::string& masterKey,
         }
         EVP_PKEY_CTX_free(pctx);
 
-        // Extract key and IV using secure buffers
-        SecureBuffer key(32);
-        SecureBuffer iv(12);
+        // Extract key and IV using stack-allocated secure buffers (no mlock overhead)
+        StackSecureBuffer<32> key;
+        StackSecureBuffer<12> iv;
         key.write(keyMaterial.data(), 32);
         iv.write(keyMaterial.data() + 32, 12);
         
@@ -576,8 +740,8 @@ CryptoResult performDecryptAndVerify(const std::string& masterKey,
         }
 
         if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, 
-                              static_cast<const uint8_t*>(key.get()), 
-                              static_cast<const uint8_t*>(iv.get())) <= 0) {
+                              key.data(), 
+                              iv.data()) <= 0) {
             EVP_CIPHER_CTX_free(ctx);
             result.errorMessage = "Failed to initialize AES-GCM decryption";
             return result;
@@ -1061,6 +1225,13 @@ Napi::Value GetCacheStats(const Napi::CallbackInfo& info) {
     stats.Set("secretKey", secretKeyStats);
     stats.Set("signingKey", signingKeyStats);
     
+    // Buffer pool stats
+    Napi::Object bufferPoolStats = Napi::Object::New(env);
+    bufferPoolStats.Set("size", Napi::Number::New(env, g_bufferPool.getPoolSize()));
+    bufferPoolStats.Set("mlockThreshold", Napi::Number::New(env, MlockConfig::getThreshold()));
+    bufferPoolStats.Set("mlockDisabled", Napi::Boolean::New(env, MlockConfig::isDisabled()));
+    stats.Set("bufferPool", bufferPoolStats);
+    
     // Legacy compatibility - keep old format at root level
     stats.Set("size", Napi::Number::New(env, g_secretKeyCache.size()));
     stats.Set("maxSize", Napi::Number::New(env, 10000));
@@ -1081,6 +1252,37 @@ Napi::Value ClearCache(const Napi::CallbackInfo& info) {
     g_signingKeyCache.clear();
     
     return env.Undefined();
+}
+
+// Configure mlock behavior at runtime
+Napi::Value ConfigureMlock(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    
+    if (info.Length() < 1 || !info[0].IsObject()) {
+        Napi::TypeError::New(env, "Expected object with mlock configuration").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+    
+    Napi::Object config = info[0].As<Napi::Object>();
+    
+    // Configure disable flag
+    if (config.Has("disable") && config.Get("disable").IsBoolean()) {
+        bool disable = config.Get("disable").As<Napi::Boolean>().Value();
+        MlockConfig::setDisableMlock(disable);
+    }
+    
+    // Configure threshold
+    if (config.Has("threshold") && config.Get("threshold").IsNumber()) {
+        uint32_t threshold = config.Get("threshold").As<Napi::Number>().Uint32Value();
+        MlockConfig::setMlockThreshold(threshold);
+    }
+    
+    // Return current configuration
+    Napi::Object result = Napi::Object::New(env);
+    result.Set("disabled", Napi::Boolean::New(env, MlockConfig::isDisabled()));
+    result.Set("threshold", Napi::Number::New(env, MlockConfig::getThreshold()));
+    
+    return result;
 }
 
 // Optimized version that accepts base64 strings directly (minimal serialization)
@@ -1153,6 +1355,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("decryptAndVerifyBase64Async", Napi::Function::New(env, DecryptAndVerifyBase64Async));
     exports.Set("getCacheStats", Napi::Function::New(env, GetCacheStats));
     exports.Set("clearCache", Napi::Function::New(env, ClearCache));
+    exports.Set("configureMlock", Napi::Function::New(env, ConfigureMlock));
     
     return exports;
 }
